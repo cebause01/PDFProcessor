@@ -6,250 +6,205 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import json
 
-# Helper Functions
 
-# Function to extract text from PDF
 def extract_text_from_pdf(pdf_file):
     reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page_num in range(len(reader.pages)):
-        page = reader.pages[page_num]
-        text += page.extract_text() or ""
-    return text
+    return "".join([page.extract_text() or "" for page in reader.pages])
 
-# Function to split text into chunks
 def split_text_into_chunks(text, chunk_size=500, overlap=50):
-    chunks = []
-    if not text:
-        return chunks
-    # Split by words to ensure chunks don't cut words in half
     words = text.split()
-    if len(words) <= chunk_size:
-        return [" ".join(words)]
-
-    i = 0
-    while i < len(words):
-        chunk = words[i:min(i + chunk_size, len(words))]
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = words[i:i + chunk_size]
         chunks.append(" ".join(chunk))
-        # Move to the next chunk, accounting for overlap
-        i += chunk_size - overlap
-        # Ensure 'i' doesn't go out of bounds or negative in edge cases
-        if i >= len(words) and len(chunk) < chunk_size: # Avoid empty chunks if at the end
-            break
-        if i < 0: # Should not happen with positive chunk_size and overlap
-            i = 0
     return chunks
 
-# Function to get embeddings from Ollama
-# Using Streamlit's cache_data for performance optimization
-@st.cache_data(show_spinner="Generating embeddings (this might take a moment)...")
+@st.cache_data(show_spinner="Embeddings...")
 def get_ollama_embeddings(text_items, ollama_api_url, model="nomic-embed-text"):
     embeddings = []
-    # Display a progress bar for embedding generation
-    progress_bar = st.progress(0, text=f"Generating embeddings for {len(text_items)} text items...")
-    
+    progress = st.progress(0)
     for i, item in enumerate(text_items):
         try:
-            response = requests.post(
-                f"{ollama_api_url}/api/embeddings",
-                json={"model": model, "prompt": item},
-            )
-            response.raise_for_status()
-            embedding = response.json().get("embedding")
-            if embedding:
-                embeddings.append(embedding)
-            else:
-                st.warning(f"Could not get embedding for an item. Skipping.")
-                embeddings.append(None) # Append None to maintain index alignment for now
-        except requests.exceptions.RequestException as e:
-            st.error(f"Error getting embedding for item: {e}")
+            res = requests.post(f"{ollama_api_url}/api/embeddings", json={"model": model, "prompt": item})
+            res.raise_for_status()
+            embedding = res.json().get("embedding")
+            embeddings.append(embedding if embedding else None)
+        except:
             embeddings.append(None)
-        # Update progress bar
-        progress_bar.progress((i + 1) / len(text_items), text=f"Generated {i+1}/{len(text_items)} embeddings.")
-    
-    progress_bar.empty() # Remove progress bar after completion
-    return [e for e in embeddings if e is not None] # Filter out any None values
+        progress.progress((i + 1) / len(text_items))
+    return [e for e in embeddings if e is not None]
 
-# Function to perform similarity search
 def retrieve_relevant_chunks(query_embedding, chunk_embeddings, chunks, top_k=3):
-    if not chunk_embeddings or not query_embedding:
-        return []
-    
-    # Convert lists to numpy arrays for efficient computation
     query_vec = np.array(query_embedding).reshape(1, -1)
     chunk_vecs = np.array(chunk_embeddings)
-
-    # Calculate cosine similarity between the query and all chunks
-    # cosine_similarity returns a 2D array, so we take the first row [0]
     similarities = cosine_similarity(query_vec, chunk_vecs)[0]
-    
-    # Get indices of the top_k most similar chunks
-    # argsort returns indices that would sort an array, [::-1] reverses it for descending order
-    top_k_indices = similarities.argsort()[-top_k:][::-1]
-    
-    # Retrieve the actual text chunks based on the sorted indices
-    relevant_chunks = [chunks[i] for i in top_k_indices]
-    return relevant_chunks
+    top_indices = similarities.argsort()[-top_k:][::-1]
+    return [chunks[i] for i in top_indices]
 
-# Function to chat with Ollama
-def chat_with_ollama(prompt, ollama_api_url, model="llama3.2"):
-    try:
-        with st.spinner("Generating response... This may take a moment."):
-            response = requests.post(
-                f"{ollama_api_url}/api/chat",
-                headers={"Content-Type": "text/plain"},  # Ensure correct Content-Type
-                data=json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}),  # Use data for raw payload
-                stream=True,  # Enable streaming response
-            )
-            response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
+# ---------- Streamlit App Starts ----------
 
-            # Process the streaming response
-            full_answer = ""
-            for line in response.iter_lines(decode_unicode=True):
-                if line.strip():  # Skip empty lines
-                    try:
-                        partial_response = json.loads(line)
-                        content = partial_response.get("message", {}).get("content", "")
-                        full_answer += content
-                        # Simulate typing by updating the placeholder
-                        st.session_state["typing_placeholder"].markdown(f"**Chat:** {full_answer}")
-                    except json.JSONDecodeError as e:
-                        st.error(f"Error parsing partial response: {e}")
-                        st.info(f"Raw partial response: {line}")  # Log raw partial response for debugging
+st.set_page_config(page_title="Document Chat", layout="centered")
+st.title("📄 Chat with Your PDF Document")
 
-            if not full_answer.strip():
-                st.warning("Ollama returned an empty response. Please check the model or server status.")
-            return full_answer.strip()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error communicating with Ollama: {e}")
-        return None
-
-# Streamlit Application
-
-st.title("Chat with Your Document")
-
-# Sidebar for file upload
+# Sidebar Upload
 uploaded_file = st.sidebar.file_uploader("Upload a PDF file", type=["pdf"])
 
-# Initialize session state variables for conversation history
-if 'conversation_history' not in st.session_state:
-    st.session_state['conversation_history'] = []  # Stores the chat history
-if 'document_chunks' not in st.session_state:
-    st.session_state['document_chunks'] = []
-if 'document_embeddings' not in st.session_state:
-    st.session_state['document_embeddings'] = []
-if 'file_processed' not in st.session_state:
-    st.session_state['file_processed'] = False
-if 'file_name' not in st.session_state:
-    st.session_state['file_name'] = ""
+# Session Initialization
+for key in ['conversation_history', 'document_chunks', 'document_embeddings', 'file_processed', 'file_name']:
+    if key not in st.session_state:
+        st.session_state[key] = [] if 'history' in key or 'chunks' in key or 'embeddings' in key else False if 'processed' in key else ""
 
-# Process the uploaded file if it's new or not yet processed
+# File Processing
 if uploaded_file and (not st.session_state['file_processed'] or st.session_state['file_name'] != uploaded_file.name):
-    st.info(f"Processing PDF '{uploaded_file.name}' and generating embeddings. This may take a moment, especially for large files...")
-    
-    # Store the file name to check if a new file is uploaded later
     st.session_state['file_name'] = uploaded_file.name
-
-    # Use BytesIO to read the PDF data, enabling PyPDF2 to work with it
+    st.info(f"Processing: {uploaded_file.name}")
     with io.BytesIO(uploaded_file.getvalue()) as pdf_buffer:
-        file_content = extract_text_from_pdf(pdf_buffer)
-
-    if file_content.strip():  # Check if any content was extracted
-        st.session_state['document_chunks'] = split_text_into_chunks(file_content)
-
-        if st.session_state['document_chunks']:
-            # Generate embeddings for each chunk using the specified Ollama embedding model
-            ollama_api_url = "http://localhost:11434"
-            embedding_model = "nomic-embed-text"
-            st.session_state['document_embeddings'] = get_ollama_embeddings(
-                st.session_state['document_chunks'], ollama_api_url, embedding_model
-            )
-            
-            if st.session_state['document_embeddings']:
-                st.session_state['file_processed'] = True
-            else:
-                st.error("Failed to generate embeddings. Please ensure Ollama is running and the embedding model is available.")
-                st.session_state['file_processed'] = False  # Reset if embedding failed
+        text = extract_text_from_pdf(pdf_buffer)
+    if text.strip():
+        chunks = split_text_into_chunks(text)
+        embeddings = get_ollama_embeddings(chunks, "http://localhost:11434")
+        if embeddings:
+            st.session_state['document_chunks'] = chunks
+            st.session_state['document_embeddings'] = embeddings
+            st.session_state['file_processed'] = True
         else:
-            st.warning("No significant text found in the PDF to chunk. It might be an image-only PDF or too short.")
-            st.session_state['file_processed'] = False
+            st.error("Failed to get embeddings.")
     else:
-        st.error("Could not extract any text from the PDF. It might be an image-only PDF, password-protected, or empty.")
-        st.session_state['file_processed'] = False  # Reset if extraction failed
+        st.error("No readable text found in the PDF.")
 
-# Chat interface section, only enabled if a file has been successfully processed
+# Chat Interface
 if st.session_state['file_processed']:
-    # Display conversation history
-    st.subheader("Chat")
-    for message in st.session_state['conversation_history']:
-        if message["role"] == "user":
-            # Align user messages to the right
-            st.markdown(f"<div style='text-align: right;'><strong>You:</strong> {message['content']}</div>", unsafe_allow_html=True)
-        else:
-            # Align bot responses to the left
-            st.markdown(f"<div style='text-align: left;'><strong>Chat:</strong> {message['content']}</div>", unsafe_allow_html=True)
+    chat_container = st.empty()
+    input_container = st.container()
 
-    # Placeholder for simulating typing
-    if "typing_placeholder" not in st.session_state:
-        st.session_state["typing_placeholder"] = st.empty()
+    def render_chat():
+        with chat_container:
+            chat_html = """
+<style>
+    .chat-bubble {
+        max-width: 80%;
+        padding: 10px 15px;
+        margin: 5px 0;
+        border-radius: 15px;
+        font-size: 15px;
+        line-height: 1.5;
+        color: black;  /* Default black font for all bubbles */
+        word-wrap: break-word;  /* Ensure text wraps within the bubble */
+        overflow-wrap: break-word;  /* Handle long words or URLs */
+    }
+    .user {
+        background-color: #DCF8C6;
+        margin-left: auto;
+        text-align: right;
+        color: black;
+    }
+    .assistant {
+        background-color: #F1F0F0;
+        margin-right: auto;
+        text-align: left;
+        color: black;
+    }
+    #chat-scroll {
+        height: 400px;
+        overflow-y: auto;
+        border: 1px solid #ccc;
+        padding: 10px;
+        border-radius: 10px;
+        background-color: rgba(255, 255, 255, 0.3);
+    }
+</style>
+<div id="chat-scroll">
+"""
 
-    # Input for user query
+            for msg in st.session_state['conversation_history']:
+                role = msg["role"]
+                content = msg["content"].replace("\n", "<br>")
+                css_class = "user" if role == "user" else "assistant"
+                chat_html += f'<div class="chat-bubble {css_class}">{content}</div>'
+            chat_html += """
+</div>
+<script>
+    const chatBox = document.getElementById("chat-scroll");
+    if (chatBox) {
+        chatBox.scrollBottom = chatBox.scrollHeight;
+    }
+</script>
+"""
+            st.markdown(chat_html, unsafe_allow_html=True)
+
     def process_query():
         user_query = st.session_state["user_query_input"]
-        if user_query:
-            # Add user query to conversation history
-            st.session_state['conversation_history'].append({"role": "user", "content": user_query})
-            st.session_state["user_query_input"] = ""  # Clear the input field
+        if not user_query:
+            return
 
-            if st.session_state['document_embeddings'] and st.session_state['document_chunks']:
-                # Get embedding for the user's query
-                query_embedding_list = get_ollama_embeddings([user_query], "http://localhost:11434", "nomic-embed-text")
-                
-                if query_embedding_list:
-                    query_embedding = query_embedding_list[0]  # get_ollama_embeddings returns a list
-                    
-                    # Retrieve the most relevant chunks from the document
-                    relevant_chunks = retrieve_relevant_chunks(
-                        query_embedding, 
-                        st.session_state['document_embeddings'], 
-                        st.session_state['document_chunks'], 
-                        top_k=3  # Retrieve top 3 most similar chunks
-                    )
-                    
-                    if relevant_chunks:
-                        context = "\n\n".join(relevant_chunks)
+        # Clear input immediately
+        st.session_state["user_query_input"] = ""
 
-                        # Construct the final prompt for the LLM, including the retrieved context and conversation history
-                        conversation_context = "\n".join(
-                            [f"{msg['role']}: {msg['content']}" for msg in st.session_state['conversation_history']]
-                        )
-                        final_prompt = f"""Using ONLY the following context, answer the question. If the answer is not directly available in the context, state that you don't have enough information from the provided document.
+        # Append user message
+        st.session_state['conversation_history'].append({"role": "user", "content": user_query})
+        render_chat()
 
-                        Context:
-                        {context}
+        # Get embedding
+        embedding = get_ollama_embeddings([user_query], "http://localhost:11434")
+        if not embedding:
+            st.error("Failed to embed query.")
+            return
 
-                        Conversation History:
-                        {conversation_context}
+        # Retrieve relevant chunks
+        relevant_chunks = retrieve_relevant_chunks(
+            embedding[0],
+            st.session_state['document_embeddings'],
+            st.session_state['document_chunks']
+        )
 
-                        Question: {user_query}
+        if not relevant_chunks:
+            st.warning("No relevant information found.")
+            return
 
-                        Answer:
-                        """
-                        # Get the answer from Ollama using the LLM model
-                        answer = chat_with_ollama(final_prompt, "http://localhost:11434", "llama3.2")
-                        if answer:
-                            # Add bot response to conversation history
-                            st.session_state['conversation_history'].append({"role": "assistant", "content": answer})
-                        else:
-                            st.warning("Could not generate an answer from Ollama. Please check Ollama server status or the model selected.")
-                    else:
-                        st.warning("No relevant information found in the document for your query.")
-                else:
-                    st.error("Failed to generate an embedding for your query. Please try again.")
-            else:
-                st.warning("Document processing not complete. Please wait or re-upload the PDF.")
+        context = "\n\n".join(relevant_chunks)
+        history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in st.session_state['conversation_history']])
+        prompt = f"""Using ONLY the following context, answer the question. If the answer is not directly available in the context, say you don't know.
 
-    st.text_input("Ask a question about the uploaded document:", key="user_query_input", on_change=process_query)
+Context:
+{context}
+
+Conversation History:
+{history}
+
+Question: {user_query}
+
+Answer:"""
+
+        # Add assistant placeholder
+        st.session_state['conversation_history'].append({"role": "assistant", "content": ""})
+        assistant_index = len(st.session_state['conversation_history']) - 1
+
+        # Stream response
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/chat",
+                headers={"Content-Type": "text/plain"},
+                data=json.dumps({"model": "llama3.2", "messages": [{"role": "user", "content": prompt}]}),
+                stream=True
+            )
+            response.raise_for_status()
+            full_answer = ""
+            for line in response.iter_lines(decode_unicode=True):
+                if line.strip():
+                    try:
+                        partial = json.loads(line)
+                        content = partial.get("message", {}).get("content", "")
+                        full_answer += content
+                        st.session_state['conversation_history'][assistant_index]["content"] = full_answer
+                        render_chat()
+                    except json.JSONDecodeError:
+                        continue
+        except requests.exceptions.RequestException as e:
+            st.error(f"Error from Ollama: {e}")
+
+    # Render chat and input
+    render_chat()
+    with input_container:
+        st.text_input("Type your question:", key="user_query_input", on_change=process_query)
 else:
-    st.info("Upload a PDF file in the sidebar to begin chatting with your document.")
-
+    st.info("Upload a PDF to start chatting.")
